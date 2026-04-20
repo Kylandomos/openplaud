@@ -26,6 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Retry logic for Plaud API calls with exponential backoff
 - Standardized error code system for client error handling
 - Test and type-check scripts in package.json
+- Canonical live transcription environment parsing and defaults in server env validation
+- Optional WhisperLive Docker Compose profile (`live-transcription`) while keeping default startup to app + db
+- Dedicated live transcription documentation for browser-microphone flow, security, compatibility, and troubleshooting
 
 ## [0.1.0] - 2025-01-22
 

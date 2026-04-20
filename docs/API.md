@@ -191,6 +191,26 @@ Transcribe a recording.
 
 ---
 
+### Live Transcription (Browser Microphone)
+
+Live transcription in OpenPlaud is for browser microphone sessions and is not Plaud Note / NotePin hardware live streaming.
+
+Behavior is controlled by environment configuration:
+
+- `LIVE_TRANSCRIPTION_ENABLED` (default `false`)
+- `WHISPERLIVE_ENABLED` (default `false`)
+- `WHISPERLIVE_URL` (required at runtime when both above are enabled)
+- `WHISPERLIVE_TIMEOUT_MS` (default `15000`)
+- `LIVE_TRANSCRIPTION_MAX_SESSION_MINUTES` (default `30`)
+- `LIVE_TRANSCRIPTION_DEFAULT_LANGUAGE` (default `auto`)
+- `LIVE_TRANSCRIPTION_DEFAULT_MODEL` (default `small`)
+
+For self-hosted deployments, keep WhisperLive on private network paths and avoid exposing it publicly unless debugging.
+
+See [LIVE_TRANSCRIPTION.md](./LIVE_TRANSCRIPTION.md) for deployment flow, browser compatibility, security notes, limitations, and troubleshooting.
+
+---
+
 ### Settings
 
 #### GET `/settings/user`

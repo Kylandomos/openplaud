@@ -191,6 +191,89 @@ export const transcriptions = pgTable(
     }),
 );
 
+// Live Transcription Sessions
+export const liveTranscriptionSessions = pgTable(
+    "live_transcription_sessions",
+    {
+        id: text("id")
+            .primaryKey()
+            .$defaultFn(() => nanoid()),
+        userId: text("user_id")
+            .notNull()
+            .references(() => users.id, { onDelete: "cascade" }),
+        status: varchar("status", { length: 30 }).notNull().default("created"),
+        provider: varchar("provider", { length: 100 })
+            .notNull()
+            .default("whisperlive"),
+        model: varchar("model", { length: 100 }),
+        language: varchar("language", { length: 20 }),
+        detectedLanguage: varchar("detected_language", { length: 20 }),
+        startedAt: timestamp("started_at").notNull().defaultNow(),
+        stoppedAt: timestamp("stopped_at"),
+        finalizedAt: timestamp("finalized_at"),
+        duration: integer("duration"),
+        lastSeq: integer("last_seq").notNull().default(0),
+        errorCode: varchar("error_code", { length: 100 }),
+        errorMessage: text("error_message"),
+        recordingId: text("recording_id").references(() => recordings.id, {
+            onDelete: "set null",
+        }),
+        metadata: jsonb("metadata"),
+        createdAt: timestamp("created_at").notNull().defaultNow(),
+        updatedAt: timestamp("updated_at").notNull().defaultNow(),
+    },
+    (table) => ({
+        userIdIdx: index("live_transcription_sessions_user_id_idx").on(
+            table.userId,
+        ),
+        statusIdx: index("live_transcription_sessions_status_idx").on(
+            table.status,
+        ),
+        userStartedAtIdx: index(
+            "live_transcription_sessions_user_id_started_at_idx",
+        ).on(table.userId, table.startedAt),
+    }),
+);
+
+// Live Transcription Segments
+export const liveTranscriptionSegments = pgTable(
+    "live_transcription_segments",
+    {
+        id: text("id")
+            .primaryKey()
+            .$defaultFn(() => nanoid()),
+        sessionId: text("session_id")
+            .notNull()
+            .references(() => liveTranscriptionSessions.id, {
+                onDelete: "cascade",
+            }),
+        userId: text("user_id")
+            .notNull()
+            .references(() => users.id, { onDelete: "cascade" }),
+        seq: integer("seq").notNull(),
+        segmentSeq: integer("segment_seq").notNull(),
+        startMs: integer("start_ms").notNull(),
+        endMs: integer("end_ms").notNull(),
+        text: text("text").notNull(),
+        isFinal: boolean("is_final").notNull().default(false),
+        language: varchar("language", { length: 20 }),
+        confidence: real("confidence"),
+        createdAt: timestamp("created_at").notNull().defaultNow(),
+    },
+    (table) => ({
+        sessionSeqUnique: unique().on(table.sessionId, table.seq),
+        sessionIdIdx: index("live_transcription_segments_session_id_idx").on(
+            table.sessionId,
+        ),
+        userIdIdx: index("live_transcription_segments_user_id_idx").on(
+            table.userId,
+        ),
+        sessionSegmentSeqIdx: index(
+            "live_transcription_segments_session_id_segment_seq_idx",
+        ).on(table.sessionId, table.segmentSeq),
+    }),
+);
+
 // AI Enhancements
 export const aiEnhancements = pgTable(
     "ai_enhancements",

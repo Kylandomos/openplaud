@@ -3,6 +3,7 @@ import { Workstation } from "@/components/dashboard/workstation";
 import { db } from "@/db";
 import { recordings, transcriptions } from "@/db/schema";
 import { requireAuth } from "@/lib/auth-server";
+import { env } from "@/lib/env";
 import { serializeRecording } from "@/types/recording";
 
 export default async function DashboardPage() {
@@ -39,10 +40,13 @@ export default async function DashboardPage() {
         ]),
     );
 
+    const liveTranscriptionAvailable = env.LIVE_TRANSCRIPTION_ENABLED;
+
     return (
         <Workstation
             recordings={recordingsData}
             transcriptions={transcriptionMap}
+            liveTranscriptionAvailable={liveTranscriptionAvailable}
         />
     );
 }

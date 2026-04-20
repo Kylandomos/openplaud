@@ -88,6 +88,7 @@ pnpm db:studio              # Open Drizzle Studio (database GUI)
 ### AI Integration
 - OpenAI SDK (universal OpenAI-compatible)
 - Transformers.js for browser transcription
+- Optional WhisperLive backend for browser-mic live transcription
 
 ## Database Development
 
@@ -266,6 +267,28 @@ BETTER_AUTH_SECRET=your-secret-here
 ENCRYPTION_KEY=your-64-char-hex-key-here
 APP_URL=http://localhost:3000
 ```
+
+Optional live transcription variables:
+
+```env
+LIVE_TRANSCRIPTION_ENABLED=false
+LIVE_TRANSCRIPTION_MAX_SESSION_MINUTES=30
+LIVE_TRANSCRIPTION_DEFAULT_LANGUAGE=auto
+LIVE_TRANSCRIPTION_DEFAULT_MODEL=small
+WHISPERLIVE_ENABLED=false
+# WHISPERLIVE_URL=http://whisperlive:9090
+WHISPERLIVE_TIMEOUT_MS=15000
+```
+
+Live transcription here means browser microphone capture inside OpenPlaud sessions. It is not Plaud Note / NotePin live hardware streaming.
+
+If you want local WhisperLive in Docker during development:
+
+```bash
+docker compose --profile live-transcription up -d
+```
+
+See [LIVE_TRANSCRIPTION.md](./LIVE_TRANSCRIPTION.md) for architecture flow, browser compatibility, security notes, limitations, and troubleshooting.
 
 ## Resources
 

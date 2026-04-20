@@ -22,6 +22,8 @@ Do NOT generate entries for:
 - Present tense: "Add", "Fix", "Improve"
 - Be specific but concise (one line per entry)
 - Mention Docker/deployment impact if relevant (e.g. new env vars, migrations)
+- For live transcription changes, explicitly say "browser microphone" and avoid wording that implies Plaud/NotePin hardware live streaming
+- Mention optional Compose profiles and env vars when deployment behavior changes (for example `live-transcription` profile)
 - If a DB migration is required, add a **⚠️ Migration Required** note at the top
 
 ## Entry Format

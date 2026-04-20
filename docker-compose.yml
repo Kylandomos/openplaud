@@ -45,6 +45,15 @@ services:
       S3_REGION: ${S3_REGION:-}
       S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-}
       S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
+
+      # Live transcription (browser microphone capture)
+      LIVE_TRANSCRIPTION_ENABLED: ${LIVE_TRANSCRIPTION_ENABLED:-false}
+      LIVE_TRANSCRIPTION_MAX_SESSION_MINUTES: ${LIVE_TRANSCRIPTION_MAX_SESSION_MINUTES:-30}
+      LIVE_TRANSCRIPTION_DEFAULT_LANGUAGE: ${LIVE_TRANSCRIPTION_DEFAULT_LANGUAGE:-auto}
+      LIVE_TRANSCRIPTION_DEFAULT_MODEL: ${LIVE_TRANSCRIPTION_DEFAULT_MODEL:-small}
+      WHISPERLIVE_ENABLED: ${WHISPERLIVE_ENABLED:-false}
+      WHISPERLIVE_URL: ${WHISPERLIVE_URL:-http://whisperlive:9090}
+      WHISPERLIVE_TIMEOUT_MS: ${WHISPERLIVE_TIMEOUT_MS:-15000}
     volumes:
       - audio:/app/audio
     depends_on:
@@ -56,6 +65,18 @@ services:
       timeout: 3s
       start_period: 30s
       retries: 3
+
+  whisperlive:
+    image: ${WHISPERLIVE_IMAGE:-ghcr.io/collabora/whisperlive-cpu:latest}
+    container_name: openplaud-whisperlive
+    restart: unless-stopped
+    profiles:
+      - live-transcription
+    expose:
+      - "9090"
+    # Optional debug-only host exposure. Keep disabled in production.
+    # ports:
+    #   - "9090:9090"
 
 volumes:
   pgdata:

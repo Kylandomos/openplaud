@@ -1,5 +1,76 @@
 import { z } from "zod";
 
+const booleanFromEnv = (defaultValue: boolean) =>
+    z
+        .string()
+        .optional()
+        .default(defaultValue ? "true" : "false")
+        .transform((value, ctx) => {
+            const normalized = value.trim().toLowerCase();
+            if (!normalized) {
+                return defaultValue;
+            }
+
+            if (["1", "true", "yes", "on"].includes(normalized)) {
+                return true;
+            }
+
+            if (["0", "false", "no", "off"].includes(normalized)) {
+                return false;
+            }
+
+            ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                message:
+                    "must be a boolean string (true/false, 1/0, yes/no, on/off)",
+            });
+            return z.NEVER;
+        });
+
+const integerFromEnv = (
+    defaultValue: number,
+    variableName: string,
+    minimum: number,
+) =>
+    z
+        .string()
+        .optional()
+        .default(String(defaultValue))
+        .transform((value, ctx) => {
+            const normalized = value.trim();
+            if (!normalized) {
+                return defaultValue;
+            }
+
+            if (!/^-?\d+$/.test(normalized)) {
+                ctx.addIssue({
+                    code: z.ZodIssueCode.custom,
+                    message: `${variableName} must be an integer`,
+                });
+                return z.NEVER;
+            }
+
+            const parsed = Number.parseInt(normalized, 10);
+
+            if (!Number.isFinite(parsed) || Number.isNaN(parsed)) {
+                ctx.addIssue({
+                    code: z.ZodIssueCode.custom,
+                    message: `${variableName} must be an integer`,
+                });
+                return z.NEVER;
+            }
+
+            if (parsed < minimum) {
+                ctx.addIssue({
+                    code: z.ZodIssueCode.custom,
+                    message: `${variableName} must be greater than or equal to ${minimum}`,
+                });
+                return z.NEVER;
+            }
+
+            return parsed;
+        });
+
 const envSchema = z.object({
     // Server-required values are optional at schema level so that `next build`
     // (phase-production-build) doesn't depend on server-only secrets.
@@ -47,6 +118,27 @@ const envSchema = z.object({
                     'SMTP_FROM must be an email address (e.g., "user@example.com") or formatted as "Name <user@example.com>"',
             },
         ),
+
+    LIVE_TRANSCRIPTION_ENABLED: booleanFromEnv(false),
+    WHISPERLIVE_ENABLED: booleanFromEnv(false),
+    WHISPERLIVE_URL: z
+        .string()
+        .optional()
+        .transform((value) => {
+            const trimmed = value?.trim();
+            return trimmed ? trimmed : undefined;
+        }),
+    WHISPERLIVE_TIMEOUT_MS: integerFromEnv(15000, "WHISPERLIVE_TIMEOUT_MS", 1),
+    LIVE_TRANSCRIPTION_MAX_SESSION_MINUTES: integerFromEnv(
+        30,
+        "LIVE_TRANSCRIPTION_MAX_SESSION_MINUTES",
+        1,
+    ),
+    LIVE_TRANSCRIPTION_DEFAULT_LANGUAGE: z
+        .string()
+        .optional()
+        .default("auto"),
+    LIVE_TRANSCRIPTION_DEFAULT_MODEL: z.string().optional().default("small"),
 });
 
 export type Env = z.infer<typeof envSchema>;
@@ -78,6 +170,16 @@ function validateEnv(): Env {
             SMTP_USER: process.env.SMTP_USER,
             SMTP_PASSWORD: process.env.SMTP_PASSWORD,
             SMTP_FROM: process.env.SMTP_FROM,
+            LIVE_TRANSCRIPTION_ENABLED: process.env.LIVE_TRANSCRIPTION_ENABLED,
+            WHISPERLIVE_ENABLED: process.env.WHISPERLIVE_ENABLED,
+            WHISPERLIVE_URL: process.env.WHISPERLIVE_URL,
+            WHISPERLIVE_TIMEOUT_MS: process.env.WHISPERLIVE_TIMEOUT_MS,
+            LIVE_TRANSCRIPTION_MAX_SESSION_MINUTES:
+                process.env.LIVE_TRANSCRIPTION_MAX_SESSION_MINUTES,
+            LIVE_TRANSCRIPTION_DEFAULT_LANGUAGE:
+                process.env.LIVE_TRANSCRIPTION_DEFAULT_LANGUAGE,
+            LIVE_TRANSCRIPTION_DEFAULT_MODEL:
+                process.env.LIVE_TRANSCRIPTION_DEFAULT_MODEL,
         });
 
         // In runtime (dev/prod servers), we require a strong encryption key.
@@ -108,6 +210,16 @@ function validateEnv(): Env {
             if (!parsed.APP_URL) {
                 throw new Error(
                     "APP_URL must be set in non-build runtime (dev/prod server)",
+                );
+            }
+
+            if (
+                parsed.LIVE_TRANSCRIPTION_ENABLED &&
+                parsed.WHISPERLIVE_ENABLED &&
+                !parsed.WHISPERLIVE_URL
+            ) {
+                throw new Error(
+                    "WHISPERLIVE_URL must be set when LIVE_TRANSCRIPTION_ENABLED=true and WHISPERLIVE_ENABLED=true",
                 );
             }
 

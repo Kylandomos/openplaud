@@ -85,6 +85,13 @@
             "when": 1775865600000,
             "tag": "0011_summary_prompt",
             "breakpoints": true
+        },
+        {
+            "idx": 12,
+            "version": "7",
+            "when": 1776714491297,
+            "tag": "0012_live_transcription",
+            "breakpoints": true
         }
     ]
 }

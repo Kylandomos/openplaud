@@ -1,6 +1,6 @@
 "use client";
 
-import { Mic, RefreshCw, Settings, Upload } from "lucide-react";
+import { Mic, Radio, RefreshCw, Settings, Upload } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
@@ -29,9 +29,14 @@ interface TranscriptionData {
 interface WorkstationProps {
     recordings: Recording[];
     transcriptions: Map<string, TranscriptionData>;
+    liveTranscriptionAvailable: boolean;
 }
 
-export function Workstation({ recordings, transcriptions }: WorkstationProps) {
+export function Workstation({
+    recordings,
+    transcriptions,
+    liveTranscriptionAvailable,
+}: WorkstationProps) {
     const router = useRouter();
     const [currentRecording, setCurrentRecording] = useState<Recording | null>(
         recordings.length > 0 ? recordings[0] : null,
@@ -278,6 +283,19 @@ export function Workstation({ recordings, transcriptions }: WorkstationProps) {
                                 <Upload className="w-4 h-4 mr-2" />
                                 {isUploading ? "Uploading..." : "Upload Audio"}
                             </Button>
+                            {liveTranscriptionAvailable && (
+                                <Button
+                                    onMouseEnter={() => router.prefetch("/live")}
+                                    onFocus={() => router.prefetch("/live")}
+                                    onClick={() => router.push("/live")}
+                                    variant="outline"
+                                    size="sm"
+                                    className="h-9"
+                                >
+                                    <Radio className="w-4 h-4 mr-2" />
+                                    Live
+                                </Button>
+                            )}
                             <Button
                                 onClick={() => setSettingsOpen(true)}
                                 variant="outline"

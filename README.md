@@ -30,6 +30,7 @@
   - Local models: LM Studio, Ollama
   - And any other OpenAI-compatible endpoint
 - **Browser Transcription** - Client-side transcription using Transformers.js (zero API costs!)
+- **Browser-Mic Live Transcription** - Optional real-time transcription pipeline with configurable WhisperLive backend
 - **AI Title Generation** - Automatically generate descriptive titles from transcriptions
 - **Multiple AI Providers** - Configure and switch between different providers
 
@@ -105,6 +106,11 @@ SMTP_FROM=noreply@example.com
 # Optional - Storage defaults
 DEFAULT_STORAGE_TYPE=local
 LOCAL_STORAGE_PATH=./storage
+
+# Optional - Browser-mic live transcription
+LIVE_TRANSCRIPTION_ENABLED=false
+WHISPERLIVE_ENABLED=false
+# WHISPERLIVE_URL=http://whisperlive:9090
 ```
 
 **4. Start the application**
@@ -315,6 +321,17 @@ OpenPlaud supports **client-side transcription** using Transformers.js, running 
 | 🎯 **Auto-Detected** | Automatically available in transcription UI |
 
 > ⚠️ **Note**: Browser transcription is slower than server-side but completely free and private. Perfect for sensitive recordings!
+
+### 🎤 Live Transcription (Browser Mic + Optional WhisperLive)
+
+OpenPlaud can run live transcription for audio captured from the browser microphone session.
+
+- This is **not** Plaud Note / NotePin hardware live streaming.
+- `LIVE_TRANSCRIPTION_ENABLED` controls the feature.
+- `WHISPERLIVE_ENABLED` and `WHISPERLIVE_URL` control optional WhisperLive integration.
+- Default Docker startup stays app + db only. WhisperLive is an optional Compose profile.
+
+See [Live Transcription Guide](docs/LIVE_TRANSCRIPTION.md) for architecture, env vars, browser support, security notes, limitations, and troubleshooting.
 
 ## 🏗️ Architecture
 

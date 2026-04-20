@@ -84,6 +84,15 @@ SMTP_SECURE=false
 SMTP_USER=your-email@gmail.com
 SMTP_PASSWORD=your-app-password
 SMTP_FROM=noreply@your-domain.com
+
+# Optional: browser-mic live transcription
+LIVE_TRANSCRIPTION_ENABLED=false
+LIVE_TRANSCRIPTION_MAX_SESSION_MINUTES=30
+LIVE_TRANSCRIPTION_DEFAULT_LANGUAGE=auto
+LIVE_TRANSCRIPTION_DEFAULT_MODEL=small
+WHISPERLIVE_ENABLED=false
+# WHISPERLIVE_URL=http://whisperlive:9090
+WHISPERLIVE_TIMEOUT_MS=15000
 ```
 
 ### 4. Start Services
@@ -91,6 +100,24 @@ SMTP_FROM=noreply@your-domain.com
 ```bash
 docker compose up -d
 ```
+
+Default `docker compose up -d` starts only `app` + `db`.
+
+To also run WhisperLive, use the optional profile:
+
+```bash
+docker compose --profile live-transcription up -d
+```
+
+When enabling WhisperLive integration, set:
+
+```env
+LIVE_TRANSCRIPTION_ENABLED=true
+WHISPERLIVE_ENABLED=true
+WHISPERLIVE_URL=http://whisperlive:9090
+```
+
+This feature is for browser microphone live transcription only (not Plaud Note / NotePin live hardware streaming).
 
 ### 5. Verify Deployment
 
@@ -192,6 +219,13 @@ pm2 startup
 | `SMTP_USER` | SMTP username | - |
 | `SMTP_PASSWORD` | SMTP password | - |
 | `SMTP_FROM` | From email address | - |
+| `LIVE_TRANSCRIPTION_ENABLED` | Enable browser-mic live transcription | `false` |
+| `LIVE_TRANSCRIPTION_MAX_SESSION_MINUTES` | Maximum live session duration | `30` |
+| `LIVE_TRANSCRIPTION_DEFAULT_LANGUAGE` | Default live language (`auto` recommended) | `auto` |
+| `LIVE_TRANSCRIPTION_DEFAULT_MODEL` | Default live model | `small` |
+| `WHISPERLIVE_ENABLED` | Enable WhisperLive backend usage | `false` |
+| `WHISPERLIVE_URL` | WhisperLive endpoint; required when both live + WhisperLive are enabled | - |
+| `WHISPERLIVE_TIMEOUT_MS` | WhisperLive request timeout in ms | `15000` |
 
 ## Database Setup
 
@@ -530,6 +564,10 @@ docker compose exec db psql -U postgres openplaud
 4. **Secrets Management**
    - Use Docker secrets
    - Or use environment secrets manager (AWS Secrets Manager, HashiCorp Vault)
+
+5. **Live Transcription Network Surface**
+   - Keep WhisperLive on private/internal networks only
+   - Do not publish WhisperLive host port in public deployments unless explicitly needed for debugging
 
 ## Scaling
 
