@@ -136,3 +136,34 @@ export interface FinalizeLiveTranscriptionResponse {
     recordingId: string | null;
     transcriptionId: string | null;
 }
+
+export interface LiveTranscriptionResume {
+    isActive: boolean;
+    lastSeq: number;
+}
+
+export interface GetLiveTranscriptionResponse {
+    session: LiveSessionSnapshot;
+    durationMs: number;
+    resume: LiveTranscriptionResume;
+}
+
+export interface LiveTranscriptionHistoryItem {
+    id: string;
+    status: LiveTranscriptionStatus;
+    createdAt: string;
+    updatedAt: string;
+    stoppedAt: string | null;
+    finalizedAt: string | null;
+    language: string | null;
+    model: string | null;
+    durationMs: number;
+    recordingId: string | null;
+    transcriptCharCount: number;
+    transcriptPreview: string;
+}
+
+export interface ListLiveTranscriptionsResponse {
+    items: LiveTranscriptionHistoryItem[];
+    nextCursor: string | null;
+}

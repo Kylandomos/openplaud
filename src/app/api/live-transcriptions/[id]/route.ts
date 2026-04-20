@@ -18,13 +18,17 @@ export async function GET(
 
     try {
         const { id } = await params;
-        const session = await liveRuntimeRegistry.getSessionSnapshotForRead(
+        const readState = await liveRuntimeRegistry.getSessionReadStateForRead(
             id,
             context.userId,
         );
         return NextResponse.json({
-            session,
-            durationMs: getSessionDurationMs(session),
+            session: readState.snapshot,
+            durationMs: getSessionDurationMs(readState.snapshot),
+            resume: {
+                isActive: readState.isActive,
+                lastSeq: readState.lastSeq,
+            },
         });
     } catch (error) {
         return liveErrorResponse(error);

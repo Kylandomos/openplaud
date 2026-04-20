@@ -4,12 +4,31 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 const TARGET_SAMPLE_RATE = 16000;
 const AUDIO_BUFFER_SIZE = 4096;
+const LIVE_RECOVERY_POINTER_KEY = "openplaud.live.recovery.pointer.v1";
+const LIVE_RECOVERY_CHECKPOINT_KEY = "openplaud.live.recovery.checkpoint.v1";
+const MAX_CHECKPOINT_SEGMENTS = 80;
+const MAX_CHECKPOINT_TEXT_LENGTH = 400;
+
+const RECOVERABLE_SESSION_STATUSES = new Set([
+    "initializing",
+    "ready",
+    "streaming",
+]);
 
 const ACTIVE_STATES = new Set<LiveTranscriptionState>([
     "requesting-microphone-permission",
     "connecting",
     "listening",
     "receiving-partial-transcript",
+]);
+
+const RECOVERY_STORAGE_STATES = new Set<LiveTranscriptionState>([
+    "requesting-microphone-permission",
+    "connecting",
+    "listening",
+    "receiving-partial-transcript",
+    "recoverable",
+    "saving",
 ]);
 
 type JsonRecord = Record<string, unknown>;
@@ -24,6 +43,7 @@ export type LiveTranscriptionState =
     | "connecting"
     | "listening"
     | "receiving-partial-transcript"
+    | "recoverable"
     | "stopped"
     | "saving"
     | "saved"
@@ -58,6 +78,24 @@ interface CreateSessionResponse {
     };
 }
 
+interface RecoveryPointer {
+    sessionId: string;
+    lastEventSeq: number;
+    updatedAt: number;
+}
+
+interface RecoveryCheckpoint {
+    sessionId: string;
+    state: LiveTranscriptionState;
+    segments: LiveTranscriptSegment[];
+    partialTranscript: string;
+    detectedLanguage: string | null;
+    startedAt: number | null;
+    stoppedAt: number | null;
+    recordingId: string | null;
+    lastEventSeq: number;
+}
+
 interface UseLiveTranscriptionResult {
     state: LiveTranscriptionState;
     sessionId: string | null;
@@ -69,9 +107,13 @@ interface UseLiveTranscriptionResult {
     elapsedMs: number;
     isActive: boolean;
     isBusy: boolean;
+    isRecovering: boolean;
+    canResumeCapture: boolean;
     errorMessage: string | null;
     recordingId: string | null;
     start: (options: StartLiveTranscriptionOptions) => Promise<boolean>;
+    resumeCapture: () => Promise<boolean>;
+    loadSession: (targetSessionId: string) => Promise<boolean>;
     stop: () => Promise<void>;
     save: (autoSummary: boolean) => Promise<SaveLiveTranscriptionResult>;
     discard: () => Promise<boolean>;
@@ -83,10 +125,7 @@ function isJsonRecord(value: unknown): value is JsonRecord {
     return typeof value === "object" && value !== null;
 }
 
-function getString(
-    source: JsonRecord,
-    ...keys: string[]
-): string | undefined {
+function getString(source: JsonRecord, ...keys: string[]): string | undefined {
     for (const key of keys) {
         const value = source[key];
         if (typeof value === "string") {
@@ -99,10 +138,7 @@ function getString(
     return undefined;
 }
 
-function getNumber(
-    source: JsonRecord,
-    ...keys: string[]
-): number | undefined {
+function getNumber(source: JsonRecord, ...keys: string[]): number | undefined {
     for (const key of keys) {
         const value = source[key];
         if (typeof value === "number" && Number.isFinite(value)) {
@@ -110,6 +146,100 @@ function getNumber(
         }
     }
     return undefined;
+}
+
+function getBoolean(
+    source: JsonRecord | null | undefined,
+    ...keys: string[]
+): boolean | undefined {
+    if (!source) return undefined;
+
+    for (const key of keys) {
+        const value = source[key];
+        if (typeof value === "boolean") {
+            return value;
+        }
+    }
+
+    return undefined;
+}
+
+function parseIsoDate(value: string | undefined): number | null {
+    if (!value) return null;
+    const parsed = Date.parse(value);
+    if (!Number.isFinite(parsed)) return null;
+    return parsed;
+}
+
+function clampPositiveInteger(value: number | undefined): number | undefined {
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+        return undefined;
+    }
+    return Math.floor(value);
+}
+
+function tokenizeEventType(rawType: string): Set<string> {
+    const normalized = rawType.trim().toLowerCase();
+    if (!normalized) return new Set();
+    return new Set(
+        normalized.split(/[^a-z0-9]+/).filter((token) => token.length > 0),
+    );
+}
+
+function isDisconnectedEventType(
+    normalizedType: string,
+    tokens: Set<string>,
+): boolean {
+    if (
+        normalizedType === "session.disconnected" ||
+        normalizedType === "session.disconnect"
+    ) {
+        return true;
+    }
+
+    return tokens.has("disconnected") || tokens.has("disconnect");
+}
+
+function isConnectedEventType(
+    normalizedType: string,
+    tokens: Set<string>,
+): boolean {
+    if (normalizedType === "session.ready") {
+        return true;
+    }
+
+    if (tokens.has("ready")) {
+        return true;
+    }
+
+    if (!tokens.has("connected") && !tokens.has("connect")) {
+        return false;
+    }
+
+    return (
+        !tokens.has("disconnected") &&
+        !tokens.has("disconnect") &&
+        !tokens.has("disconnecting")
+    );
+}
+
+function getCheckpointSegments(
+    segments: LiveTranscriptSegment[],
+): LiveTranscriptSegment[] {
+    return segments.slice(-MAX_CHECKPOINT_SEGMENTS).map((segment) => ({
+        ...segment,
+        text: segment.text.slice(0, MAX_CHECKPOINT_TEXT_LENGTH),
+    }));
+}
+
+function readStorageJson<T>(storage: Storage, key: string): T | null {
+    const raw = storage.getItem(key);
+    if (!raw) return null;
+    try {
+        return JSON.parse(raw) as T;
+    } catch {
+        return null;
+    }
 }
 
 function normalizeLiveError(rawError: unknown, fallback: string): string {
@@ -152,16 +282,24 @@ async function parseJsonBody(response: Response): Promise<JsonRecord | null> {
     }
 }
 
-function mapResponseError(response: Response, payload: JsonRecord | null): string {
+function mapResponseError(
+    response: Response,
+    payload: JsonRecord | null,
+): string {
     const payloadMessage =
         (payload && getString(payload, "error", "message")) || undefined;
-    const payloadCode = (payload && getString(payload, "errorCode", "code")) || "";
+    const payloadCode =
+        (payload && getString(payload, "errorCode", "code")) || "";
 
     if (response.status === 401 || response.status === 403) {
         return "Your session expired. Refresh and sign in again.";
     }
 
-    if (response.status === 404 || response.status === 502 || response.status === 503) {
+    if (
+        response.status === 404 ||
+        response.status === 502 ||
+        response.status === 503
+    ) {
         return "Live transcription backend is unavailable right now.";
     }
 
@@ -198,7 +336,10 @@ function mixToMono(inputBuffer: AudioBuffer): Float32Array {
     return mono;
 }
 
-function resampleTo16k(input: Float32Array, inputSampleRate: number): Float32Array {
+function resampleTo16k(
+    input: Float32Array,
+    inputSampleRate: number,
+): Float32Array {
     if (inputSampleRate === TARGET_SAMPLE_RATE) {
         return input;
     }
@@ -248,6 +389,9 @@ export function useLiveTranscription(): UseLiveTranscriptionResult {
     const [elapsedMs, setElapsedMs] = useState(0);
     const [startedAt, setStartedAt] = useState<number | null>(null);
     const [stoppedAt, setStoppedAt] = useState<number | null>(null);
+    const [isRecovering, setIsRecovering] = useState(false);
+    const [canResumeCapture, setCanResumeCapture] = useState(false);
+    const [lastEventSeq, setLastEventSeq] = useState(0);
 
     const streamRef = useRef<MediaStream | null>(null);
     const audioContextRef = useRef<AudioContext | null>(null);
@@ -259,9 +403,13 @@ export function useLiveTranscription(): UseLiveTranscriptionResult {
     const uploadChainRef = useRef<Promise<void>>(Promise.resolve());
     const isUnmountingRef = useRef(false);
     const hasTerminalErrorRef = useRef(false);
+    const lastEventSeqRef = useRef(0);
+    const hasRestoredFromStorageRef = useRef(false);
 
     const nextSegmentSeqRef = useRef(1);
-    const segmentOrderRef = useRef<Map<number, LiveTranscriptSegment>>(new Map());
+    const segmentOrderRef = useRef<Map<number, LiveTranscriptSegment>>(
+        new Map(),
+    );
     const stateRef = useRef<LiveTranscriptionState>("idle");
 
     const finalTranscript = useMemo(
@@ -282,6 +430,20 @@ export function useLiveTranscription(): UseLiveTranscriptionResult {
     useEffect(() => {
         stateRef.current = state;
     }, [state]);
+
+    const updateLastEventSeq = useCallback((nextSeq: number | undefined) => {
+        const normalized = clampPositiveInteger(nextSeq);
+        if (!normalized) return;
+        if (normalized <= lastEventSeqRef.current) return;
+        lastEventSeqRef.current = normalized;
+        setLastEventSeq(normalized);
+    }, []);
+
+    const clearRecoveryStorage = useCallback(() => {
+        if (typeof window === "undefined") return;
+        window.localStorage.removeItem(LIVE_RECOVERY_POINTER_KEY);
+        window.sessionStorage.removeItem(LIVE_RECOVERY_CHECKPOINT_KEY);
+    }, []);
 
     const closeEventStream = useCallback(() => {
         if (eventSourceRef.current) {
@@ -340,15 +502,25 @@ export function useLiveTranscription(): UseLiveTranscriptionResult {
         uploadSeqRef.current = 0;
         uploadChainRef.current = Promise.resolve();
         hasTerminalErrorRef.current = false;
+        lastEventSeqRef.current = 0;
+        setLastEventSeq(0);
         setSessionId(null);
         setRecordingId(null);
         setErrorMessage(null);
         setElapsedMs(0);
         setStartedAt(null);
         setStoppedAt(null);
+        setCanResumeCapture(false);
+        setIsRecovering(false);
         setState("idle");
         clearTranscriptState();
-    }, [clearTranscriptState, closeEventStream, stopAudioCapture]);
+        clearRecoveryStorage();
+    }, [
+        clearRecoveryStorage,
+        clearTranscriptState,
+        closeEventStream,
+        stopAudioCapture,
+    ]);
 
     const setTerminalError = useCallback(
         (message: string) => {
@@ -356,6 +528,7 @@ export function useLiveTranscription(): UseLiveTranscriptionResult {
             hasTerminalErrorRef.current = true;
             setErrorMessage(message);
             setState("error");
+            setCanResumeCapture(false);
             setStoppedAt((prev) => prev ?? Date.now());
             stopAudioCapture();
             closeEventStream();
@@ -371,31 +544,201 @@ export function useLiveTranscription(): UseLiveTranscriptionResult {
         setSegments(ordered);
     }, []);
 
-    const consumeEventPayload = useCallback(
-        (payload: JsonRecord) => {
-            const eventType =
-                getString(payload, "type", "event", "name") || "message";
-            const lowerEventType = eventType.toLowerCase();
+    const applySessionSnapshot = useCallback(
+        (snapshot: JsonRecord, fallbackSessionId?: string) => {
+            const resolvedSessionId =
+                getString(snapshot, "id", "sessionId") ||
+                fallbackSessionId ||
+                null;
+            if (resolvedSessionId) {
+                setSessionId(resolvedSessionId);
+            }
 
-            if (
-                lowerEventType.includes("snapshot") &&
-                isJsonRecord(payload.session)
-            ) {
-                const snapshot = payload.session;
-                const snapshotLanguage = getString(
+            const createdAtMs = parseIsoDate(
+                getString(snapshot, "createdAt", "startedAt"),
+            );
+            const stoppedAtMs = parseIsoDate(
+                getString(snapshot, "stoppedAt", "finalizedAt"),
+            );
+            setStartedAt((prev) => createdAtMs ?? prev);
+            setStoppedAt(stoppedAtMs);
+
+            const snapshotLanguage = getString(
+                snapshot,
+                "language",
+                "detectedLanguage",
+            );
+            setDetectedLanguage(snapshotLanguage || null);
+
+            const nextRecordingId = getString(snapshot, "recordingId");
+            setRecordingId(nextRecordingId || null);
+
+            const segmentList = Array.isArray(snapshot.transcriptSegments)
+                ? snapshot.transcriptSegments
+                : Array.isArray(snapshot.segments)
+                  ? snapshot.segments
+                  : [];
+
+            const snapshotSegments = new Map<number, LiveTranscriptSegment>();
+            for (let index = 0; index < segmentList.length; index += 1) {
+                const candidate = segmentList[index];
+                if (!isJsonRecord(candidate)) continue;
+
+                const text = getString(candidate, "text", "transcript");
+                if (!text) continue;
+
+                const seqFromId = (() => {
+                    const idValue = getString(candidate, "id");
+                    if (!idValue) return undefined;
+                    const parsed = Number.parseInt(idValue, 10);
+                    return Number.isFinite(parsed) ? parsed : undefined;
+                })();
+
+                const rawSeq =
+                    getNumber(candidate, "segmentSeq", "seq") ??
+                    seqFromId ??
+                    index + 1;
+                const seq = clampPositiveInteger(rawSeq) || index + 1;
+
+                const startMs =
+                    getNumber(candidate, "startMs") ??
+                    (() => {
+                        const startSec = getNumber(candidate, "startSec");
+                        return typeof startSec === "number"
+                            ? Math.round(startSec * 1000)
+                            : undefined;
+                    })();
+                const endMs =
+                    getNumber(candidate, "endMs") ??
+                    (() => {
+                        const endSec = getNumber(candidate, "endSec");
+                        return typeof endSec === "number"
+                            ? Math.round(endSec * 1000)
+                            : undefined;
+                    })();
+
+                snapshotSegments.set(seq, {
+                    id: `${seq}`,
+                    text,
+                    seq,
+                    startMs,
+                    endMs,
+                    isFinal: candidate.isFinal !== false,
+                });
+            }
+
+            segmentOrderRef.current = snapshotSegments;
+            const orderedSegments = [...snapshotSegments.entries()]
+                .sort((a, b) => a[0] - b[0])
+                .map((entry) => entry[1]);
+            setSegments(orderedSegments);
+            setPartialTranscript("");
+            nextSegmentSeqRef.current =
+                orderedSegments.length > 0
+                    ? orderedSegments[orderedSegments.length - 1].seq + 1
+                    : 1;
+
+            const explicitLastSeq = getNumber(snapshot, "lastSeq", "eventSeq");
+            updateLastEventSeq(explicitLastSeq);
+
+            const status = getString(snapshot, "status")?.toLowerCase() || "";
+            const snapshotError = isJsonRecord(snapshot.error)
+                ? getString(snapshot.error, "message", "error")
+                : getString(snapshot, "errorMessage", "error");
+
+            const resumeConfig = isJsonRecord(snapshot.resume)
+                ? snapshot.resume
+                : null;
+            const explicitResume =
+                getBoolean(
                     snapshot,
-                    "language",
-                    "detectedLanguage",
+                    "canResumeCapture",
+                    "resumeCapture",
+                    "resume",
+                ) ??
+                getBoolean(
+                    resumeConfig,
+                    "canCapture",
+                    "canResumeCapture",
+                    "allowed",
                 );
-                if (snapshotLanguage) {
-                    setDetectedLanguage(snapshotLanguage);
-                }
+            const canResumeFromStatus =
+                RECOVERABLE_SESSION_STATUSES.has(status);
 
-                const snapshotRecordingId = getString(snapshot, "recordingId");
-                if (snapshotRecordingId) {
-                    setRecordingId(snapshotRecordingId);
-                }
+            if (status === "finalizing") {
+                setState("saving");
+                setErrorMessage(null);
+                setCanResumeCapture(false);
+                return;
+            }
 
+            if (status === "finalized") {
+                setState("saved");
+                setErrorMessage(null);
+                setCanResumeCapture(false);
+                return;
+            }
+
+            if (status === "error" || status === "expired") {
+                setState("error");
+                setErrorMessage(snapshotError || "Live transcription failed.");
+                setCanResumeCapture(false);
+                return;
+            }
+
+            if (status === "stopping" || status === "stopped") {
+                setState("stopped");
+                setErrorMessage(snapshotError || null);
+                setCanResumeCapture(false);
+                return;
+            }
+
+            if (canResumeFromStatus) {
+                if (streamRef.current) {
+                    setState("listening");
+                    setCanResumeCapture(false);
+                } else {
+                    setState("recoverable");
+                    setCanResumeCapture(
+                        resolvedSessionId
+                            ? (explicitResume ?? canResumeFromStatus)
+                            : false,
+                    );
+                }
+                setErrorMessage(snapshotError || null);
+                return;
+            }
+
+            if (resolvedSessionId) {
+                setState("stopped");
+            }
+            setCanResumeCapture(false);
+            setErrorMessage(snapshotError || null);
+        },
+        [updateLastEventSeq],
+    );
+
+    const consumeEventPayload = useCallback(
+        (payload: JsonRecord, fallbackEventType?: string) => {
+            updateLastEventSeq(getNumber(payload, "seq", "eventSeq"));
+            const eventType =
+                getString(payload, "type", "event", "name") ||
+                fallbackEventType ||
+                "message";
+            const lowerEventType = eventType.toLowerCase();
+            const eventTokens = tokenizeEventType(lowerEventType);
+            const hasToken = (token: string) => eventTokens.has(token);
+            const disconnectedEvent = isDisconnectedEventType(
+                lowerEventType,
+                eventTokens,
+            );
+            const connectedEvent = isConnectedEventType(
+                lowerEventType,
+                eventTokens,
+            );
+
+            if (hasToken("snapshot") && isJsonRecord(payload.session)) {
+                applySessionSnapshot(payload.session);
                 return;
             }
 
@@ -410,14 +753,15 @@ export function useLiveTranscription(): UseLiveTranscriptionResult {
             }
 
             if (
-                lowerEventType.includes("error") ||
-                lowerEventType.includes("failed")
+                lowerEventType === "session.error" ||
+                hasToken("error") ||
+                hasToken("failed")
             ) {
                 const serverMessage =
                     getString(payload, "message", "error") ||
                     "Live transcription failed.";
                 const code = getString(payload, "errorCode", "code");
-                if (code && code.includes("SESSION_TOO_LONG")) {
+                if (code?.includes("SESSION_TOO_LONG")) {
                     setTerminalError(
                         "This session reached the maximum allowed duration. Stop and save, then start a new one.",
                     );
@@ -428,30 +772,41 @@ export function useLiveTranscription(): UseLiveTranscriptionResult {
             }
 
             if (
-                lowerEventType.includes("saved") ||
-                lowerEventType.includes("session.saved")
+                lowerEventType === "session.saved" ||
+                lowerEventType === "session.finalized" ||
+                hasToken("saved")
             ) {
                 setRecordingId(getString(payload, "recordingId") || null);
                 setState("saved");
+                setCanResumeCapture(false);
                 setStoppedAt((prev) => prev ?? Date.now());
                 return;
             }
 
-            if (
-                lowerEventType.includes("stopped") ||
-                lowerEventType.includes("finalized")
-            ) {
+            if (disconnectedEvent) {
+                setPartialTranscript("");
+                setState("recoverable");
+                setCanResumeCapture(Boolean(sessionId));
+                setStoppedAt((prev) => prev ?? Date.now());
+                return;
+            }
+
+            if (lowerEventType === "session.stopped" || hasToken("stopped")) {
                 setPartialTranscript("");
                 setState("stopped");
+                setCanResumeCapture(false);
                 setStoppedAt((prev) => prev ?? Date.now());
                 return;
             }
 
-            if (
-                lowerEventType.includes("connected") ||
-                lowerEventType.includes("ready")
-            ) {
-                setState("listening");
+            if (connectedEvent) {
+                if (streamRef.current) {
+                    setState("listening");
+                    setCanResumeCapture(false);
+                } else {
+                    setState("recoverable");
+                    setCanResumeCapture(Boolean(sessionId));
+                }
                 return;
             }
 
@@ -466,7 +821,7 @@ export function useLiveTranscription(): UseLiveTranscriptionResult {
             const explicitFinal = Boolean(
                 segmentPayload.isFinal === true ||
                     payload.isFinal === true ||
-                    lowerEventType.includes("final"),
+                    hasToken("final"),
             );
 
             if (!explicitFinal) {
@@ -487,7 +842,10 @@ export function useLiveTranscription(): UseLiveTranscriptionResult {
                 getNumber(payload, "segmentSeq", "seq") ??
                 nextSegmentSeqRef.current;
 
-            nextSegmentSeqRef.current = Math.max(nextSegmentSeqRef.current, seq + 1);
+            nextSegmentSeqRef.current = Math.max(
+                nextSegmentSeqRef.current,
+                seq + 1,
+            );
 
             upsertFinalSegment({
                 id: `${seq}`,
@@ -503,17 +861,38 @@ export function useLiveTranscription(): UseLiveTranscriptionResult {
             });
 
             setPartialTranscript("");
-            setState("listening");
+            if (streamRef.current) {
+                setState("listening");
+                setCanResumeCapture(false);
+            } else {
+                setState("recoverable");
+                setCanResumeCapture(Boolean(sessionId));
+            }
         },
-        [setTerminalError, upsertFinalSegment],
+        [
+            applySessionSnapshot,
+            sessionId,
+            setTerminalError,
+            updateLastEventSeq,
+            upsertFinalSegment,
+        ],
     );
 
     const attachEventStream = useCallback(
-        (targetSessionId: string, explicitEventsUrl?: string) => {
-            const eventsUrl =
+        (targetSessionId: string, explicitEventsUrl?: string, afterSeq = 0) => {
+            closeEventStream();
+
+            const baseEventsUrl =
                 explicitEventsUrl ||
                 `/api/live-transcriptions/${targetSessionId}/events`;
-            const eventSource = new EventSource(eventsUrl);
+            const eventsUrl = new URL(baseEventsUrl, window.location.origin);
+            const normalizedAfterSeq = clampPositiveInteger(afterSeq);
+            if (normalizedAfterSeq) {
+                eventsUrl.searchParams.set("afterSeq", `${normalizedAfterSeq}`);
+                updateLastEventSeq(normalizedAfterSeq);
+            }
+
+            const eventSource = new EventSource(eventsUrl.toString());
             eventSourceRef.current = eventSource;
 
             eventSource.onopen = () => {
@@ -523,11 +902,15 @@ export function useLiveTranscription(): UseLiveTranscriptionResult {
             };
 
             const handleServerEvent = (event: MessageEvent<string>) => {
+                const eventId = Number.parseInt(event.lastEventId, 10);
+                if (Number.isFinite(eventId) && eventId > 0) {
+                    updateLastEventSeq(eventId);
+                }
                 if (!event.data) return;
                 try {
                     const payload = JSON.parse(event.data) as unknown;
                     if (isJsonRecord(payload)) {
-                        consumeEventPayload(payload);
+                        consumeEventPayload(payload, event.type);
                     }
                 } catch {
                     // Ignore non-JSON keepalive payloads.
@@ -550,6 +933,13 @@ export function useLiveTranscription(): UseLiveTranscriptionResult {
                     return;
                 }
 
+                if (
+                    currentState === "recoverable" ||
+                    currentState === "stopped"
+                ) {
+                    return;
+                }
+
                 if (currentState === "connecting") {
                     setTerminalError(
                         "Could not connect to the live transcription stream.",
@@ -567,7 +957,12 @@ export function useLiveTranscription(): UseLiveTranscriptionResult {
                 }
             };
         },
-        [consumeEventPayload, setTerminalError],
+        [
+            closeEventStream,
+            consumeEventPayload,
+            setTerminalError,
+            updateLastEventSeq,
+        ],
     );
 
     const postAudioChunk = useCallback(
@@ -640,7 +1035,10 @@ export function useLiveTranscription(): UseLiveTranscriptionResult {
                 }
 
                 const mono = mixToMono(event.inputBuffer);
-                const resampled = resampleTo16k(mono, event.inputBuffer.sampleRate);
+                const resampled = resampleTo16k(
+                    mono,
+                    event.inputBuffer.sampleRate,
+                );
                 if (!resampled.length) return;
 
                 const transferableChunk = new Float32Array(resampled.length);
@@ -659,6 +1057,164 @@ export function useLiveTranscription(): UseLiveTranscriptionResult {
         },
         [enqueueChunkUpload],
     );
+
+    const loadSession = useCallback(
+        async (targetSessionId: string) => {
+            const normalizedId = targetSessionId.trim();
+            if (!normalizedId) {
+                return false;
+            }
+
+            stopAudioCapture();
+            closeEventStream();
+            uploadChainRef.current = Promise.resolve();
+            hasTerminalErrorRef.current = false;
+            setErrorMessage(null);
+            setIsRecovering(true);
+            setSessionId(normalizedId);
+
+            try {
+                const response = await fetch(
+                    `/api/live-transcriptions/${normalizedId}`,
+                );
+                const payload = await parseJsonBody(response);
+
+                if (!response.ok) {
+                    setState("error");
+                    setCanResumeCapture(false);
+                    setErrorMessage(
+                        mapResponseError(response, payload) ||
+                            "Unable to load live session.",
+                    );
+
+                    if (
+                        response.status === 404 ||
+                        response.status === 410 ||
+                        response.status === 403
+                    ) {
+                        clearRecoveryStorage();
+                    }
+
+                    return false;
+                }
+
+                const snapshot =
+                    payload && isJsonRecord(payload.session)
+                        ? payload.session
+                        : payload && isJsonRecord(payload.snapshot)
+                          ? payload.snapshot
+                          : payload;
+
+                if (!snapshot || !isJsonRecord(snapshot)) {
+                    throw new Error("Live session payload was invalid.");
+                }
+
+                applySessionSnapshot(snapshot, normalizedId);
+
+                const payloadLastSeq =
+                    getNumber(snapshot, "lastSeq", "eventSeq") ??
+                    (payload
+                        ? getNumber(payload, "lastSeq", "eventSeq")
+                        : undefined);
+                updateLastEventSeq(payloadLastSeq);
+
+                const snapshotStatus = getString(
+                    snapshot,
+                    "status",
+                )?.toLowerCase();
+                const isActiveSession =
+                    (payload
+                        ? getBoolean(payload, "isActive", "active")
+                        : undefined) ??
+                    Boolean(
+                        snapshotStatus &&
+                            RECOVERABLE_SESSION_STATUSES.has(snapshotStatus),
+                    );
+
+                if (isActiveSession) {
+                    const replayAfterSeq = Math.max(
+                        lastEventSeqRef.current,
+                        payloadLastSeq ?? 0,
+                    );
+                    attachEventStream(normalizedId, undefined, replayAfterSeq);
+                }
+
+                return true;
+            } catch (error: unknown) {
+                setState("error");
+                setCanResumeCapture(false);
+                setErrorMessage(
+                    normalizeLiveError(error, "Unable to load live session."),
+                );
+                return false;
+            } finally {
+                setIsRecovering(false);
+            }
+        },
+        [
+            applySessionSnapshot,
+            attachEventStream,
+            clearRecoveryStorage,
+            closeEventStream,
+            stopAudioCapture,
+            updateLastEventSeq,
+        ],
+    );
+
+    const resumeCapture = useCallback(async () => {
+        if (state === "saving" || !sessionId || !canResumeCapture) {
+            return false;
+        }
+
+        if (
+            typeof window === "undefined" ||
+            (typeof window.AudioContext === "undefined" &&
+                typeof (window as BrowserWindow).webkitAudioContext ===
+                    "undefined") ||
+            typeof window.EventSource === "undefined" ||
+            !navigator.mediaDevices?.getUserMedia
+        ) {
+            setState("error");
+            setErrorMessage(
+                "Live transcription requires a modern browser with microphone and streaming support.",
+            );
+            return false;
+        }
+
+        setErrorMessage(null);
+        setState("requesting-microphone-permission");
+        setCanResumeCapture(false);
+
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({
+                audio: true,
+            });
+            streamRef.current = stream;
+
+            setState("connecting");
+            const resumeAfterSeq = Math.max(0, lastEventSeqRef.current);
+            attachEventStream(sessionId, undefined, resumeAfterSeq);
+            await setupAudioPipeline(sessionId, stream);
+            setStoppedAt(null);
+            setState("listening");
+            return true;
+        } catch (error: unknown) {
+            const message = normalizeLiveError(
+                error,
+                "Unable to resume microphone capture.",
+            );
+            setTerminalError(message);
+            setCanResumeCapture(true);
+            return false;
+        }
+    }, [
+        attachEventStream,
+        canResumeCapture,
+        sessionId,
+        setupAudioPipeline,
+        setTerminalError,
+        state,
+    ]);
 
     const start = useCallback(
         async (options: StartLiveTranscriptionOptions) => {
@@ -706,11 +1262,14 @@ export function useLiveTranscription(): UseLiveTranscriptionResult {
 
                 if (!createResponse.ok) {
                     const createBody = await parseJsonBody(createResponse);
-                    throw new Error(mapResponseError(createResponse, createBody));
+                    throw new Error(
+                        mapResponseError(createResponse, createBody),
+                    );
                 }
 
-                const created =
-                    (await parseJsonBody(createResponse)) as CreateSessionResponse | null;
+                const created = (await parseJsonBody(
+                    createResponse,
+                )) as CreateSessionResponse | null;
                 const createdSessionId =
                     created?.sessionId || created?.id || created?.session?.id;
 
@@ -722,7 +1281,11 @@ export function useLiveTranscription(): UseLiveTranscriptionResult {
                 setSessionId(createdSessionId);
                 setStartedAt(Date.now());
                 setStoppedAt(null);
+                setCanResumeCapture(false);
+                setIsRecovering(false);
                 uploadSeqRef.current = 0;
+                lastEventSeqRef.current = 0;
+                setLastEventSeq(0);
 
                 attachEventStream(createdSessionId, created?.eventsUrl);
                 await setupAudioPipeline(createdSessionId, stream);
@@ -756,6 +1319,7 @@ export function useLiveTranscription(): UseLiveTranscriptionResult {
 
         setStoppedAt((prev) => prev ?? Date.now());
         setState("stopped");
+        setCanResumeCapture(false);
 
         try {
             await fetch(`/api/live-transcriptions/${sessionId}/stop`, {
@@ -808,7 +1372,9 @@ export function useLiveTranscription(): UseLiveTranscriptionResult {
 
                 setRecordingId(nextRecordingId || null);
                 setState("saved");
+                setCanResumeCapture(false);
                 setStoppedAt((prev) => prev ?? Date.now());
+                clearRecoveryStorage();
                 return {
                     success: true,
                     recordingId: nextRecordingId,
@@ -824,7 +1390,7 @@ export function useLiveTranscription(): UseLiveTranscriptionResult {
                 return { success: false };
             }
         },
-        [sessionId, state, stop],
+        [clearRecoveryStorage, sessionId, state, stop],
     );
 
     const discard = useCallback(async () => {
@@ -837,9 +1403,12 @@ export function useLiveTranscription(): UseLiveTranscriptionResult {
         closeEventStream();
 
         try {
-            const response = await fetch(`/api/live-transcriptions/${sessionId}`, {
-                method: "DELETE",
-            });
+            const response = await fetch(
+                `/api/live-transcriptions/${sessionId}`,
+                {
+                    method: "DELETE",
+                },
+            );
             if (!response.ok) {
                 const payload = await parseJsonBody(response);
                 setState("error");
@@ -876,6 +1445,127 @@ export function useLiveTranscription(): UseLiveTranscriptionResult {
 
         return fallbackCopyText(text);
     }, [combinedTranscript]);
+
+    useEffect(() => {
+        if (typeof window === "undefined") return;
+        if (hasRestoredFromStorageRef.current) return;
+        hasRestoredFromStorageRef.current = true;
+
+        const pointer = readStorageJson<RecoveryPointer>(
+            window.localStorage,
+            LIVE_RECOVERY_POINTER_KEY,
+        );
+        if (!pointer?.sessionId) {
+            return;
+        }
+
+        updateLastEventSeq(pointer.lastEventSeq);
+
+        const checkpoint = readStorageJson<RecoveryCheckpoint>(
+            window.sessionStorage,
+            LIVE_RECOVERY_CHECKPOINT_KEY,
+        );
+        if (checkpoint?.sessionId === pointer.sessionId) {
+            updateLastEventSeq(checkpoint.lastEventSeq);
+
+            const checkpointSegments = Array.isArray(checkpoint.segments)
+                ? checkpoint.segments
+                      .filter(
+                          (segment): segment is LiveTranscriptSegment =>
+                              typeof segment?.id === "string" &&
+                              typeof segment?.text === "string" &&
+                              typeof segment?.seq === "number",
+                      )
+                      .sort((left, right) => left.seq - right.seq)
+                : [];
+
+            segmentOrderRef.current = new Map(
+                checkpointSegments.map((segment) => [segment.seq, segment]),
+            );
+            nextSegmentSeqRef.current =
+                checkpointSegments.length > 0
+                    ? checkpointSegments[checkpointSegments.length - 1].seq + 1
+                    : 1;
+
+            setSessionId(pointer.sessionId);
+            setSegments(checkpointSegments);
+            setPartialTranscript(checkpoint.partialTranscript || "");
+            setDetectedLanguage(checkpoint.detectedLanguage || null);
+            setRecordingId(checkpoint.recordingId || null);
+            setStartedAt(checkpoint.startedAt ?? null);
+            setStoppedAt(checkpoint.stoppedAt ?? null);
+            setCanResumeCapture(true);
+
+            const restoredState = checkpoint.state;
+            if (
+                restoredState === "listening" ||
+                restoredState === "receiving-partial-transcript" ||
+                restoredState === "connecting" ||
+                restoredState === "requesting-microphone-permission"
+            ) {
+                setState("recoverable");
+            } else if (restoredState === "idle") {
+                setState("recoverable");
+            } else {
+                setState(restoredState);
+            }
+        }
+
+        void loadSession(pointer.sessionId);
+    }, [loadSession, updateLastEventSeq]);
+
+    useEffect(() => {
+        if (typeof window === "undefined") return;
+
+        const shouldPersistRecovery =
+            Boolean(sessionId) && RECOVERY_STORAGE_STATES.has(state);
+
+        if (!shouldPersistRecovery || !sessionId) {
+            clearRecoveryStorage();
+            return;
+        }
+
+        const pointer: RecoveryPointer = {
+            sessionId,
+            lastEventSeq,
+            updatedAt: Date.now(),
+        };
+        window.localStorage.setItem(
+            LIVE_RECOVERY_POINTER_KEY,
+            JSON.stringify(pointer),
+        );
+
+        const checkpoint: RecoveryCheckpoint = {
+            sessionId,
+            state:
+                state === "listening" ||
+                state === "receiving-partial-transcript"
+                    ? "recoverable"
+                    : state,
+            segments: getCheckpointSegments(segments),
+            partialTranscript,
+            detectedLanguage,
+            startedAt,
+            stoppedAt,
+            recordingId,
+            lastEventSeq,
+        };
+        window.sessionStorage.setItem(
+            LIVE_RECOVERY_CHECKPOINT_KEY,
+            JSON.stringify(checkpoint),
+        );
+    }, [
+        clearRecoveryStorage,
+        detectedLanguage,
+        lastEventSeq,
+        partialTranscript,
+        recordingId,
+        segments,
+        sessionId,
+        startedAt,
+        state,
+        stoppedAt,
+    ]);
 
     useEffect(() => {
         if (!startedAt) {
@@ -916,9 +1606,13 @@ export function useLiveTranscription(): UseLiveTranscriptionResult {
         elapsedMs,
         isActive,
         isBusy,
+        isRecovering,
+        canResumeCapture,
         errorMessage,
         recordingId,
         start,
+        resumeCapture,
+        loadSession,
         stop,
         save,
         discard,

@@ -7,6 +7,7 @@ import type {
     LiveEvent,
     LiveSessionConfig,
     LiveSessionSnapshot,
+    LiveTranscriptionStatus,
 } from "@/types/live-transcription";
 import { calculateDurationMs } from "./audio";
 import { getLiveRuntimeEnvironment } from "./config";
@@ -16,6 +17,10 @@ import {
     deletePersistedLiveSession,
     getPersistedLiveSessionRecord,
     getPersistedLiveSessionSnapshot,
+    getPersistedLiveSessionState,
+    listPersistedLiveSessionHistory,
+    type PersistedLiveSessionHistoryCursor,
+    type PersistedLiveSessionHistoryItem,
     persistLiveSegment,
     persistLiveSessionState,
 } from "./session-store";
@@ -38,10 +43,20 @@ interface LiveRuntimeSession {
     segmentSeqById: Map<string, number>;
     segmentMap: Map<string, LiveSessionSnapshot["transcriptSegments"][number]>;
     cleanupTimer: NodeJS.Timeout | null;
+    finalizePromise: Promise<{
+        snapshot: LiveSessionSnapshot;
+        recordingId: string | null;
+    }> | null;
 }
 
 interface SessionLookup {
     runtime: LiveRuntimeSession;
+}
+
+interface LiveSessionReadState {
+    snapshot: LiveSessionSnapshot;
+    isActive: boolean;
+    lastSeq: number;
 }
 
 export class LiveSessionError extends Error {
@@ -164,6 +179,7 @@ export class LiveRuntimeRegistry {
             segmentSeqById: new Map(),
             segmentMap: new Map(),
             cleanupTimer: null,
+            finalizePromise: null,
         };
 
         this.sessions.set(sessionId, runtime);
@@ -193,7 +209,10 @@ export class LiveRuntimeRegistry {
             }
         }
 
-        const persisted = await getPersistedLiveSessionSnapshot(sessionId, userId);
+        const persisted = await getPersistedLiveSessionSnapshot(
+            sessionId,
+            userId,
+        );
         if (!persisted) {
             throw new LiveSessionError(
                 "not-found",
@@ -209,12 +228,13 @@ export class LiveRuntimeRegistry {
         sessionId: string,
         userId: string,
         afterSeq = 0,
-    ): { snapshot: LiveSessionSnapshot; events: LiveEvent[] } {
+    ): { snapshot: LiveSessionSnapshot; events: LiveEvent[]; lastSeq: number } {
         const { runtime } = this.lookupSession(sessionId, userId);
         const events = runtime.events.filter((event) => event.seq > afterSeq);
         return {
             snapshot: runtime.snapshot,
             events,
+            lastSeq: Math.max(0, runtime.nextSeq - 1),
         };
     }
 
@@ -226,13 +246,15 @@ export class LiveRuntimeRegistry {
         snapshot: LiveSessionSnapshot;
         events: LiveEvent[];
         isActive: boolean;
+        lastSeq: number;
     }> {
         try {
             const active = this.getSessionEvents(sessionId, userId, afterSeq);
             return {
                 snapshot: active.snapshot,
                 events: active.events,
-                isActive: true,
+                isActive: this.isSessionActive(active.snapshot),
+                lastSeq: active.lastSeq,
             };
         } catch (error) {
             if (
@@ -243,7 +265,7 @@ export class LiveRuntimeRegistry {
             }
         }
 
-        const persisted = await getPersistedLiveSessionSnapshot(sessionId, userId);
+        const persisted = await getPersistedLiveSessionState(sessionId, userId);
         if (!persisted) {
             throw new LiveSessionError(
                 "not-found",
@@ -253,10 +275,64 @@ export class LiveRuntimeRegistry {
         }
 
         return {
-            snapshot: persisted,
+            snapshot: persisted.snapshot,
             events: [],
             isActive: false,
+            lastSeq: persisted.lastSeq,
         };
+    }
+
+    async getSessionReadStateForRead(
+        sessionId: string,
+        userId: string,
+    ): Promise<LiveSessionReadState> {
+        const runtime = this.sessions.get(sessionId);
+        if (runtime) {
+            if (runtime.userId !== userId) {
+                throw new LiveSessionError(
+                    "forbidden",
+                    "You do not have access to this live session",
+                    403,
+                );
+            }
+            this.ensureNotExpired(runtime, true);
+            return this.createReadStateFromRuntime(runtime);
+        }
+
+        const persisted = await getPersistedLiveSessionState(sessionId, userId);
+        if (!persisted) {
+            throw new LiveSessionError(
+                "not-found",
+                "Live transcription session not found",
+                404,
+            );
+        }
+
+        return {
+            snapshot: persisted.snapshot,
+            isActive: false,
+            lastSeq: persisted.lastSeq,
+        };
+    }
+
+    async listSessionHistoryForRead(
+        userId: string,
+        options?: {
+            limit?: number;
+            cursor?: { createdAt: Date; id: string } | null;
+            status?: LiveTranscriptionStatus | null;
+        },
+    ): Promise<{
+        items: PersistedLiveSessionHistoryItem[];
+        nextCursor: PersistedLiveSessionHistoryCursor | null;
+    }> {
+        const limit = options?.limit ?? 20;
+        return await listPersistedLiveSessionHistory({
+            userId,
+            limit,
+            cursor: options?.cursor ?? null,
+            status: options?.status ?? null,
+        });
     }
 
     subscribe(
@@ -343,8 +419,47 @@ export class LiveRuntimeRegistry {
         userId: string,
         request: FinalizeLiveTranscriptionRequest | undefined,
     ): Promise<{ snapshot: LiveSessionSnapshot; recordingId: string | null }> {
-        const { runtime } = this.lookupSession(sessionId, userId);
+        const runtime = this.sessions.get(sessionId);
+        if (!runtime) {
+            const persisted = await getPersistedLiveSessionState(
+                sessionId,
+                userId,
+            );
+            if (!persisted) {
+                throw new LiveSessionError(
+                    "not-found",
+                    "Live transcription session not found",
+                    404,
+                );
+            }
+
+            if (persisted.snapshot.recordingId) {
+                return {
+                    snapshot: persisted.snapshot,
+                    recordingId: persisted.snapshot.recordingId,
+                };
+            }
+
+            throw new LiveSessionError(
+                "bad-request",
+                "Live transcription session is no longer active and cannot be finalized",
+                409,
+            );
+        }
+
+        if (runtime.userId !== userId) {
+            throw new LiveSessionError(
+                "forbidden",
+                "You do not have access to this live session",
+                403,
+            );
+        }
+
         this.ensureNotExpired(runtime, true);
+
+        if (runtime.finalizePromise) {
+            return await runtime.finalizePromise;
+        }
 
         if (runtime.snapshot.status === "finalized") {
             await this.persistSession(runtime);
@@ -354,44 +469,13 @@ export class LiveRuntimeRegistry {
             };
         }
 
-        runtime.snapshot.status = "finalizing";
-        runtime.snapshot.updatedAt = new Date().toISOString();
-        runtime.adapter?.close();
-        await this.persistSession(runtime);
+        runtime.finalizePromise = this.runFinalize(runtime, request).finally(
+            () => {
+                runtime.finalizePromise = null;
+            },
+        );
 
-        const finalizedAt = new Date();
-        const result = await persistFinalizedLiveSession({
-            sessionId: runtime.id,
-            userId: runtime.userId,
-            createdAt: new Date(runtime.snapshot.createdAt),
-            finalizedAt,
-            title:
-                typeof request?.title === "string" && request.title.trim()
-                    ? request.title.trim()
-                    : null,
-            transcriptText: runtime.snapshot.transcriptText,
-            language: runtime.snapshot.language,
-            config: runtime.snapshot.config,
-            audioChunks: runtime.audioChunks,
-            autoSummary: request?.autoSummary === true,
-        });
-
-        runtime.snapshot.status = "finalized";
-        runtime.snapshot.finalizedAt = finalizedAt.toISOString();
-        runtime.snapshot.stoppedAt =
-            runtime.snapshot.stoppedAt ?? finalizedAt.toISOString();
-        runtime.snapshot.updatedAt = finalizedAt.toISOString();
-        runtime.snapshot.recordingId = result.recordingId;
-        runtime.snapshot.transcriptionId = result.transcriptionId;
-
-        this.emit(runtime, "session.finalized");
-        await this.persistSession(runtime);
-        this.scheduleCleanup(runtime);
-
-        return {
-            snapshot: runtime.snapshot,
-            recordingId: result.recordingId,
-        };
+        return await runtime.finalizePromise;
     }
 
     async discardSession(sessionId: string, userId: string): Promise<void> {
@@ -423,7 +507,10 @@ export class LiveRuntimeRegistry {
             return;
         }
 
-        const persisted = await getPersistedLiveSessionRecord(sessionId, userId);
+        const persisted = await getPersistedLiveSessionRecord(
+            sessionId,
+            userId,
+        );
         if (!persisted) {
             throw new LiveSessionError(
                 "not-found",
@@ -569,7 +656,12 @@ export class LiveRuntimeRegistry {
                     text: segment.text,
                 });
                 const segmentSeq = runtime.segmentSeqById.get(segment.id) ?? 0;
-                this.queuePersistSegment(runtime, emitted.seq, segmentSeq, segment);
+                this.queuePersistSegment(
+                    runtime,
+                    emitted.seq,
+                    segmentSeq,
+                    segment,
+                );
             }
 
             runtime.snapshot.transcriptSegments = runtime.segmentOrder
@@ -670,6 +762,70 @@ export class LiveRuntimeRegistry {
         runtime.snapshot.updatedAt = new Date().toISOString();
         this.emit(runtime, "session.error");
         this.queuePersistSession(runtime);
+    }
+
+    private createReadStateFromRuntime(
+        runtime: LiveRuntimeSession,
+    ): LiveSessionReadState {
+        return {
+            snapshot: runtime.snapshot,
+            isActive: this.isSessionActive(runtime.snapshot),
+            lastSeq: Math.max(0, runtime.nextSeq - 1),
+        };
+    }
+
+    private isSessionActive(snapshot: LiveSessionSnapshot): boolean {
+        return (
+            snapshot.status === "initializing" ||
+            snapshot.status === "ready" ||
+            snapshot.status === "streaming" ||
+            snapshot.status === "stopping" ||
+            snapshot.status === "finalizing"
+        );
+    }
+
+    private async runFinalize(
+        runtime: LiveRuntimeSession,
+        request: FinalizeLiveTranscriptionRequest | undefined,
+    ): Promise<{ snapshot: LiveSessionSnapshot; recordingId: string | null }> {
+        runtime.snapshot.status = "finalizing";
+        runtime.snapshot.updatedAt = new Date().toISOString();
+        runtime.adapter?.close();
+        await this.persistSession(runtime);
+
+        const finalizedAt = new Date();
+        const result = await persistFinalizedLiveSession({
+            sessionId: runtime.id,
+            userId: runtime.userId,
+            createdAt: new Date(runtime.snapshot.createdAt),
+            finalizedAt,
+            title:
+                typeof request?.title === "string" && request.title.trim()
+                    ? request.title.trim()
+                    : null,
+            transcriptText: runtime.snapshot.transcriptText,
+            language: runtime.snapshot.language,
+            config: runtime.snapshot.config,
+            audioChunks: runtime.audioChunks,
+            autoSummary: request?.autoSummary === true,
+        });
+
+        runtime.snapshot.status = "finalized";
+        runtime.snapshot.finalizedAt = finalizedAt.toISOString();
+        runtime.snapshot.stoppedAt =
+            runtime.snapshot.stoppedAt ?? finalizedAt.toISOString();
+        runtime.snapshot.updatedAt = finalizedAt.toISOString();
+        runtime.snapshot.recordingId = result.recordingId;
+        runtime.snapshot.transcriptionId = result.transcriptionId;
+
+        this.emit(runtime, "session.finalized");
+        await this.persistSession(runtime);
+        this.scheduleCleanup(runtime);
+
+        return {
+            snapshot: runtime.snapshot,
+            recordingId: result.recordingId,
+        };
     }
 
     private async persistSession(runtime: LiveRuntimeSession): Promise<void> {

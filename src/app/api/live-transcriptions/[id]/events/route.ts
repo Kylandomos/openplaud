@@ -4,11 +4,21 @@ import { liveErrorResponse, requireLiveUser } from "../../_common";
 
 export const runtime = "nodejs";
 
-function parseLastEventId(raw: string | null): number {
+function parseSequence(raw: string | null): number {
     if (!raw) return 0;
     const parsed = Number.parseInt(raw, 10);
     if (!Number.isFinite(parsed) || parsed <= 0) return 0;
     return parsed;
+}
+
+function parseAfterSeq(request: Request): number {
+    const url = new URL(request.url);
+    const fromQuery = parseSequence(url.searchParams.get("afterSeq"));
+    if (fromQuery > 0) {
+        return fromQuery;
+    }
+
+    return parseSequence(request.headers.get("last-event-id"));
 }
 
 function formatSseFrame(
@@ -37,8 +47,8 @@ export async function GET(
 
     try {
         const { id } = await params;
-        const afterSeq = parseLastEventId(request.headers.get("last-event-id"));
-        const { snapshot, events, isActive } =
+        const afterSeq = parseAfterSeq(request);
+        const { snapshot, events, isActive, lastSeq } =
             await liveRuntimeRegistry.getSessionEventsForRead(
                 id,
                 context.userId,
@@ -57,6 +67,7 @@ export async function GET(
                     formatSseFrame("snapshot", {
                         session: snapshot,
                         replayedEvents: events.length,
+                        lastSeq,
                     }),
                 );
 

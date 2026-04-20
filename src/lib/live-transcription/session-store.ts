@@ -1,4 +1,4 @@
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, desc, eq, lt, or } from "drizzle-orm";
 import { db } from "@/db";
 import {
     liveTranscriptionSegments,
@@ -49,6 +49,41 @@ interface PersistedLiveSessionMetadata {
     transcriptionId?: string | null;
 }
 
+export interface PersistedLiveSessionHistoryCursor {
+    createdAt: string;
+    id: string;
+}
+
+export interface PersistedLiveSessionHistoryItem {
+    id: string;
+    status: LiveTranscriptionStatus;
+    createdAt: string;
+    updatedAt: string;
+    stoppedAt: string | null;
+    finalizedAt: string | null;
+    language: string | null;
+    model: string | null;
+    durationMs: number;
+    recordingId: string | null;
+    transcriptCharCount: number;
+    transcriptPreview: string;
+}
+
+export interface ListPersistedLiveSessionHistoryInput {
+    userId: string;
+    limit: number;
+    status?: LiveTranscriptionStatus | null;
+    cursor?: {
+        createdAt: Date;
+        id: string;
+    } | null;
+}
+
+export interface ListPersistedLiveSessionHistoryResult {
+    items: PersistedLiveSessionHistoryItem[];
+    nextCursor: PersistedLiveSessionHistoryCursor | null;
+}
+
 export interface PersistLiveSessionStateInput {
     sessionId: string;
     userId: string;
@@ -70,6 +105,12 @@ export interface PersistedLiveSessionRecord {
     userId: string;
     status: string;
     recordingId: string | null;
+    lastSeq: number;
+}
+
+export interface PersistedLiveSessionState {
+    snapshot: LiveSessionSnapshot;
+    lastSeq: number;
 }
 
 function toDateOrNull(value: string | null): Date | null {
@@ -204,6 +245,167 @@ function resolveSegments(
         }));
 }
 
+function normalizeTranscriptText(
+    metadata: PersistedLiveSessionMetadata,
+): string {
+    if (typeof metadata.transcriptText !== "string") {
+        return "";
+    }
+    return metadata.transcriptText;
+}
+
+function toTranscriptPreview(text: string, maxChars = 240): string {
+    const normalized = text.replace(/\s+/g, " ").trim();
+    if (!normalized) return "";
+    if (normalized.length <= maxChars) {
+        return normalized;
+    }
+    return `${normalized.slice(0, maxChars).trimEnd()}...`;
+}
+
+function resolveDurationMs(
+    duration: number | null,
+    metadata: PersistedLiveSessionMetadata,
+): number {
+    if (typeof duration === "number" && Number.isFinite(duration)) {
+        return Math.max(0, Math.round(duration));
+    }
+
+    const audioSampleCount = toOptionalNumber(metadata.audioSampleCount);
+    if (typeof audioSampleCount === "number") {
+        return calculateDurationMs(audioSampleCount, 16000);
+    }
+
+    return 0;
+}
+
+type PersistedSessionRow = typeof liveTranscriptionSessions.$inferSelect;
+type PersistedSegmentRow = {
+    segmentSeq: number;
+    text: string;
+    startMs: number;
+    endMs: number;
+    isFinal: boolean;
+};
+
+async function getPersistedSessionRow(
+    sessionId: string,
+    userId: string,
+): Promise<PersistedSessionRow | null> {
+    const [sessionRow] = await db
+        .select()
+        .from(liveTranscriptionSessions)
+        .where(
+            and(
+                eq(liveTranscriptionSessions.id, sessionId),
+                eq(liveTranscriptionSessions.userId, userId),
+            ),
+        )
+        .limit(1);
+
+    return sessionRow ?? null;
+}
+
+async function getPersistedSegmentRows(
+    sessionId: string,
+    userId: string,
+): Promise<PersistedSegmentRow[]> {
+    return await db
+        .select({
+            segmentSeq: liveTranscriptionSegments.segmentSeq,
+            text: liveTranscriptionSegments.text,
+            startMs: liveTranscriptionSegments.startMs,
+            endMs: liveTranscriptionSegments.endMs,
+            isFinal: liveTranscriptionSegments.isFinal,
+        })
+        .from(liveTranscriptionSegments)
+        .where(
+            and(
+                eq(liveTranscriptionSegments.sessionId, sessionId),
+                eq(liveTranscriptionSegments.userId, userId),
+            ),
+        )
+        .orderBy(
+            asc(liveTranscriptionSegments.seq),
+            asc(liveTranscriptionSegments.segmentSeq),
+        );
+}
+
+function buildPersistedSnapshot(
+    sessionRow: PersistedSessionRow,
+    segmentRows: PersistedSegmentRow[],
+): LiveSessionSnapshot {
+    const metadata = asMetadata(sessionRow.metadata);
+    const config = resolveConfig(
+        metadata,
+        sessionRow.model,
+        sessionRow.language,
+    );
+    const createdAt = sessionRow.startedAt ?? sessionRow.createdAt;
+    const resolvedSegments = resolveSegments(segmentRows);
+    const transcriptText =
+        typeof metadata.transcriptText === "string"
+            ? metadata.transcriptText
+            : resolvedSegments
+                  .map((segment) => segment.text)
+                  .join(" ")
+                  .replace(/\s+/g, " ")
+                  .trim();
+    const audioBytesReceived =
+        toOptionalNumber(metadata.audioBytesReceived) ?? 0;
+    const audioSampleCount = toOptionalNumber(metadata.audioSampleCount) ?? 0;
+
+    const warning =
+        typeof metadata.warning === "string" ? metadata.warning : null;
+    const transcriptionId =
+        typeof metadata.transcriptionId === "string"
+            ? metadata.transcriptionId
+            : null;
+
+    const errorCode = normalizeErrorCode(sessionRow.errorCode);
+    const errorMessage = sessionRow.errorMessage;
+
+    return {
+        id: sessionRow.id,
+        status: normalizeStatus(sessionRow.status),
+        config,
+        createdAt: createdAt.toISOString(),
+        updatedAt: sessionRow.updatedAt.toISOString(),
+        expiresAt:
+            typeof metadata.expiresAt === "string"
+                ? metadata.expiresAt
+                : new Date(
+                      createdAt.getTime() +
+                          config.maxSessionMinutes * 60 * 1000,
+                  ).toISOString(),
+        stoppedAt: sessionRow.stoppedAt
+            ? sessionRow.stoppedAt.toISOString()
+            : null,
+        finalizedAt: sessionRow.finalizedAt
+            ? sessionRow.finalizedAt.toISOString()
+            : null,
+        language: sessionRow.detectedLanguage ?? sessionRow.language,
+        transcriptText,
+        transcriptSegments: resolvedSegments,
+        audioBytesReceived,
+        audioSampleCount,
+        recordingId: sessionRow.recordingId,
+        transcriptionId,
+        warning,
+        error:
+            errorCode || errorMessage
+                ? {
+                      code: errorCode ?? "runtime-error",
+                      message:
+                          errorMessage ?? "Unknown live transcription error",
+                      retryable:
+                          errorCode === "provider-error" ||
+                          errorCode === "provider-unavailable",
+                  }
+                : null,
+    };
+}
+
 export async function persistLiveSessionState(
     input: PersistLiveSessionStateInput,
 ): Promise<void> {
@@ -215,7 +417,10 @@ export async function persistLiveSessionState(
     const updatedAt = toDateOrNull(input.snapshot.updatedAt) || now;
     const stoppedAt = toDateOrNull(input.snapshot.stoppedAt);
     const finalizedAt = toDateOrNull(input.snapshot.finalizedAt);
-    const duration = calculateDurationMs(input.snapshot.audioSampleCount, 16000);
+    const duration = calculateDurationMs(
+        input.snapshot.audioSampleCount,
+        16000,
+    );
     const metadata = buildMetadata(input.snapshot);
 
     await db
@@ -307,6 +512,7 @@ export async function getPersistedLiveSessionRecord(
             userId: liveTranscriptionSessions.userId,
             status: liveTranscriptionSessions.status,
             recordingId: liveTranscriptionSessions.recordingId,
+            lastSeq: liveTranscriptionSessions.lastSeq,
         })
         .from(liveTranscriptionSessions)
         .where(
@@ -338,98 +544,114 @@ export async function getPersistedLiveSessionSnapshot(
     sessionId: string,
     userId: string,
 ): Promise<LiveSessionSnapshot | null> {
-    const [sessionRow] = await db
-        .select()
-        .from(liveTranscriptionSessions)
-        .where(
-            and(
-                eq(liveTranscriptionSessions.id, sessionId),
-                eq(liveTranscriptionSessions.userId, userId),
-            ),
-        )
-        .limit(1);
+    const persistedState = await getPersistedLiveSessionState(
+        sessionId,
+        userId,
+    );
+    if (!persistedState) {
+        return null;
+    }
 
+    return persistedState.snapshot;
+}
+
+export async function getPersistedLiveSessionState(
+    sessionId: string,
+    userId: string,
+): Promise<PersistedLiveSessionState | null> {
+    const sessionRow = await getPersistedSessionRow(sessionId, userId);
     if (!sessionRow) {
         return null;
     }
 
-    const segmentRows = await db
-        .select({
-            segmentSeq: liveTranscriptionSegments.segmentSeq,
-            text: liveTranscriptionSegments.text,
-            startMs: liveTranscriptionSegments.startMs,
-            endMs: liveTranscriptionSegments.endMs,
-            isFinal: liveTranscriptionSegments.isFinal,
-        })
-        .from(liveTranscriptionSegments)
-        .where(
-            and(
-                eq(liveTranscriptionSegments.sessionId, sessionId),
-                eq(liveTranscriptionSegments.userId, userId),
-            ),
-        )
-        .orderBy(
-            asc(liveTranscriptionSegments.seq),
-            asc(liveTranscriptionSegments.segmentSeq),
-        );
-
-    const metadata = asMetadata(sessionRow.metadata);
-    const config = resolveConfig(metadata, sessionRow.model, sessionRow.language);
-    const createdAt = sessionRow.startedAt ?? sessionRow.createdAt;
-    const resolvedSegments = resolveSegments(segmentRows);
-    const transcriptText =
-        typeof metadata.transcriptText === "string"
-            ? metadata.transcriptText
-            : resolvedSegments
-                  .map((segment) => segment.text)
-                  .join(" ")
-                  .replace(/\s+/g, " ")
-                  .trim();
-    const audioBytesReceived = toOptionalNumber(metadata.audioBytesReceived) ?? 0;
-    const audioSampleCount = toOptionalNumber(metadata.audioSampleCount) ?? 0;
-
-    const warning =
-        typeof metadata.warning === "string" ? metadata.warning : null;
-    const transcriptionId =
-        typeof metadata.transcriptionId === "string"
-            ? metadata.transcriptionId
-            : null;
-
-    const errorCode = normalizeErrorCode(sessionRow.errorCode);
-    const errorMessage = sessionRow.errorMessage;
-
+    const segmentRows = await getPersistedSegmentRows(sessionId, userId);
     return {
-        id: sessionRow.id,
-        status: normalizeStatus(sessionRow.status),
-        config,
-        createdAt: createdAt.toISOString(),
-        updatedAt: sessionRow.updatedAt.toISOString(),
-        expiresAt:
-            typeof metadata.expiresAt === "string"
-                ? metadata.expiresAt
-                : new Date(
-                      createdAt.getTime() + config.maxSessionMinutes * 60 * 1000,
-                  ).toISOString(),
-        stoppedAt: sessionRow.stoppedAt ? sessionRow.stoppedAt.toISOString() : null,
-        finalizedAt: sessionRow.finalizedAt
-            ? sessionRow.finalizedAt.toISOString()
-            : null,
-        language: sessionRow.detectedLanguage ?? sessionRow.language,
-        transcriptText,
-        transcriptSegments: resolvedSegments,
-        audioBytesReceived,
-        audioSampleCount,
-        recordingId: sessionRow.recordingId,
-        transcriptionId,
-        warning,
-        error:
-            errorCode || errorMessage
+        snapshot: buildPersistedSnapshot(sessionRow, segmentRows),
+        lastSeq: Math.max(0, sessionRow.lastSeq),
+    };
+}
+
+export async function listPersistedLiveSessionHistory(
+    input: ListPersistedLiveSessionHistoryInput,
+): Promise<ListPersistedLiveSessionHistoryResult> {
+    const pageSize = Math.max(1, Math.min(100, Math.floor(input.limit)));
+    const cursor = input.cursor ?? null;
+
+    const clauses = [eq(liveTranscriptionSessions.userId, input.userId)];
+    if (input.status) {
+        clauses.push(eq(liveTranscriptionSessions.status, input.status));
+    }
+    if (cursor) {
+        const cursorPredicate = or(
+            lt(liveTranscriptionSessions.startedAt, cursor.createdAt),
+            and(
+                eq(liveTranscriptionSessions.startedAt, cursor.createdAt),
+                lt(liveTranscriptionSessions.id, cursor.id),
+            ),
+        );
+        if (!cursorPredicate) {
+            return {
+                items: [],
+                nextCursor: null,
+            };
+        }
+
+        clauses.push(cursorPredicate);
+    }
+
+    const rows = await db
+        .select({
+            id: liveTranscriptionSessions.id,
+            status: liveTranscriptionSessions.status,
+            startedAt: liveTranscriptionSessions.startedAt,
+            updatedAt: liveTranscriptionSessions.updatedAt,
+            stoppedAt: liveTranscriptionSessions.stoppedAt,
+            finalizedAt: liveTranscriptionSessions.finalizedAt,
+            language: liveTranscriptionSessions.language,
+            detectedLanguage: liveTranscriptionSessions.detectedLanguage,
+            model: liveTranscriptionSessions.model,
+            duration: liveTranscriptionSessions.duration,
+            recordingId: liveTranscriptionSessions.recordingId,
+            metadata: liveTranscriptionSessions.metadata,
+        })
+        .from(liveTranscriptionSessions)
+        .where(and(...clauses))
+        .orderBy(
+            desc(liveTranscriptionSessions.startedAt),
+            desc(liveTranscriptionSessions.id),
+        )
+        .limit(pageSize + 1);
+
+    const hasMore = rows.length > pageSize;
+    const pageRows = hasMore ? rows.slice(0, pageSize) : rows;
+
+    const items: PersistedLiveSessionHistoryItem[] = pageRows.map((row) => {
+        const metadata = asMetadata(row.metadata);
+        const transcriptText = normalizeTranscriptText(metadata);
+        return {
+            id: row.id,
+            status: normalizeStatus(row.status),
+            createdAt: row.startedAt.toISOString(),
+            updatedAt: row.updatedAt.toISOString(),
+            stoppedAt: row.stoppedAt ? row.stoppedAt.toISOString() : null,
+            finalizedAt: row.finalizedAt ? row.finalizedAt.toISOString() : null,
+            language: row.detectedLanguage ?? row.language,
+            model: row.model,
+            durationMs: resolveDurationMs(row.duration, metadata),
+            recordingId: row.recordingId,
+            transcriptCharCount: transcriptText.length,
+            transcriptPreview: toTranscriptPreview(transcriptText),
+        };
+    });
+
+    const cursorRow = rows[pageSize];
+    return {
+        items,
+        nextCursor:
+            hasMore && cursorRow
                 ? {
-                      code: errorCode ?? "runtime-error",
-                      message: errorMessage ?? "Unknown live transcription error",
-                      retryable:
-                          errorCode === "provider-error" ||
-                          errorCode === "provider-unavailable",
+                      createdAt: cursorRow.startedAt.toISOString(),
+                      id: cursorRow.id,
                   }
                 : null,
     };

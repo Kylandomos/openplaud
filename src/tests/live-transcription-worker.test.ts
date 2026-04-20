@@ -6,6 +6,8 @@ const {
     mockGetLiveRuntimeEnvironment,
     mockPersistLiveSessionState,
     mockPersistLiveSegment,
+    mockGetPersistedLiveSessionState,
+    mockListPersistedLiveSessionHistory,
     mockGetPersistedLiveSessionRecord,
     mockGetPersistedLiveSessionSnapshot,
     mockDeletePersistedLiveSession,
@@ -18,6 +20,8 @@ const {
     mockGetLiveRuntimeEnvironment: vi.fn(),
     mockPersistLiveSessionState: vi.fn(),
     mockPersistLiveSegment: vi.fn(),
+    mockGetPersistedLiveSessionState: vi.fn(),
+    mockListPersistedLiveSessionHistory: vi.fn(),
     mockGetPersistedLiveSessionRecord: vi.fn(),
     mockGetPersistedLiveSessionSnapshot: vi.fn(),
     mockDeletePersistedLiveSession: vi.fn(),
@@ -37,6 +41,8 @@ vi.mock("@/lib/live-transcription/persistence", () => ({
 vi.mock("@/lib/live-transcription/session-store", () => ({
     persistLiveSessionState: mockPersistLiveSessionState,
     persistLiveSegment: mockPersistLiveSegment,
+    getPersistedLiveSessionState: mockGetPersistedLiveSessionState,
+    listPersistedLiveSessionHistory: mockListPersistedLiveSessionHistory,
     getPersistedLiveSessionRecord: mockGetPersistedLiveSessionRecord,
     getPersistedLiveSessionSnapshot: mockGetPersistedLiveSessionSnapshot,
     deletePersistedLiveSession: mockDeletePersistedLiveSession,
@@ -79,7 +85,12 @@ describe("Live Transcription Runtime Worker", () => {
     let inboundHandler:
         | ((event: {
               type: "status" | "language" | "segments";
-              status?: "SERVER_READY" | "WAIT" | "WARNING" | "ERROR" | "DISCONNECT";
+              status?:
+                  | "SERVER_READY"
+                  | "WAIT"
+                  | "WARNING"
+                  | "ERROR"
+                  | "DISCONNECT";
               message?: string | null;
               language?: string;
               segments?: Array<{
@@ -99,6 +110,11 @@ describe("Live Transcription Runtime Worker", () => {
         mockGetLiveRuntimeEnvironment.mockReturnValue(createRuntimeEnv());
         mockPersistLiveSessionState.mockResolvedValue(undefined);
         mockPersistLiveSegment.mockResolvedValue(undefined);
+        mockGetPersistedLiveSessionState.mockResolvedValue(null);
+        mockListPersistedLiveSessionHistory.mockResolvedValue({
+            items: [],
+            nextCursor: null,
+        });
         mockGetPersistedLiveSessionRecord.mockResolvedValue(null);
         mockGetPersistedLiveSessionSnapshot.mockResolvedValue(null);
         mockDeletePersistedLiveSession.mockResolvedValue(undefined);
@@ -208,11 +224,17 @@ describe("Live Transcription Runtime Worker", () => {
         });
 
         const all = await registry.getSessionEvents(session.id, "user-1", 0);
-        const afterFirst = await registry.getSessionEvents(session.id, "user-1", 1);
+        const afterFirst = await registry.getSessionEvents(
+            session.id,
+            "user-1",
+            1,
+        );
 
         expect(all.snapshot.transcriptText).toBe("second first");
         expect(afterFirst.events.every((event) => event.seq > 1)).toBe(true);
-        expect(afterFirst.events).toHaveLength(Math.max(0, all.events.length - 1));
+        expect(afterFirst.events).toHaveLength(
+            Math.max(0, all.events.length - 1),
+        );
     });
 
     it("forwards audio chunks to the provider when the socket is open", async () => {
@@ -235,5 +257,36 @@ describe("Live Transcription Runtime Worker", () => {
         expect(mockAdapterSendChunk).toHaveBeenCalledWith(
             expect.any(Float32Array),
         );
+    });
+
+    it("finalize is idempotent for concurrent and retried calls", async () => {
+        const { LiveRuntimeRegistry } = await import(
+            "@/lib/live-transcription/runtime-registry"
+        );
+
+        const registry = new LiveRuntimeRegistry();
+        const session = await registry.createSession("user-1", {});
+
+        const [first, second] = await Promise.all([
+            registry.finalizeSession(session.id, "user-1", {
+                title: "Live save",
+                autoSummary: false,
+            }),
+            registry.finalizeSession(session.id, "user-1", {
+                title: "Live save",
+                autoSummary: false,
+            }),
+        ]);
+
+        expect(mockPersistFinalizedLiveSession).toHaveBeenCalledTimes(1);
+        expect(first.recordingId).toBe("rec-1");
+        expect(second.recordingId).toBe("rec-1");
+
+        const third = await registry.finalizeSession(session.id, "user-1", {
+            title: "Live save",
+            autoSummary: false,
+        });
+        expect(mockPersistFinalizedLiveSession).toHaveBeenCalledTimes(1);
+        expect(third.recordingId).toBe("rec-1");
     });
 });
