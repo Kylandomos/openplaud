@@ -15,7 +15,7 @@ jobs:
   package:
     runs-on: ubuntu-latest
     steps:
-      - name: Download multilingual medium Q5_0 model
+      - name: Download and split multilingual medium Q5_0 model
         shell: bash
         run: |
           set -euo pipefail
@@ -23,11 +23,21 @@ jobs:
             -o ggml-medium-q5_0.bin \
             https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium-q5_0.bin
           echo "19fea4b380c3a618ec4723c3eef2eb785ffba0d0538cf43f8f235e7b3b34220f  ggml-medium-q5_0.bin" | sha256sum -c -
+          split -b 260M -d -a 1 ggml-medium-q5_0.bin ggml-medium-q5_0.part-
+          ls -lh ggml-medium-q5_0.part-*
 
-      - name: Upload model artifact
+      - name: Upload part 0
         uses: actions/upload-artifact@v4
         with:
-          name: whisper-medium-q5-0
-          path: ggml-medium-q5_0.bin
+          name: whisper-medium-q5-0-part-0
+          path: ggml-medium-q5_0.part-0
+          retention-days: 1
+          compression-level: 0
+
+      - name: Upload part 1
+        uses: actions/upload-artifact@v4
+        with:
+          name: whisper-medium-q5-0-part-1
+          path: ggml-medium-q5_0.part-1
           retention-days: 1
           compression-level: 0
